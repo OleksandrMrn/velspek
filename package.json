@@ -1,0 +1,33 @@
+{
+  "name": "velspek",
+  "version": "0.1.0",
+  "description": "Spec-driven development kit for AI coding agents (Claude Code, Codex): rules, skills and approval gates recorded in files.",
+  "keywords": [
+    "spec-driven-development",
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "agents-md",
+    "skills"
+  ],
+  "license": "MIT",
+  "author": "OleksandrMrn",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OleksandrMrn/velspek.git"
+  },
+  "type": "module",
+  "bin": {
+    "velspek": "bin/velspek.mjs"
+  },
+  "files": [
+    "bin",
+    "template"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/cli.test.mjs test/check.test.mjs"
+  }
+}

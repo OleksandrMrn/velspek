@@ -1,7 +1,8 @@
 .DS_Store
+node_modules/
+*.tgz
 .env
 .env.*
 !.env.example
 .claude/settings.local.json
 CLAUDE.local.md
-__pycache__/
