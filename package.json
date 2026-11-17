@@ -1,6 +1,6 @@
 {
   "name": "velspek",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Spec-driven development kit for AI coding agents (Claude Code, Codex): rules, skills and approval gates recorded in files.",
   "keywords": [
     "spec-driven-development",
