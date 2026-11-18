@@ -2,9 +2,11 @@
 // velspek: installs, updates and removes the spec-driven development kit in a repository.
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { check } from '../template/docs/specs/_tools/check.mjs';
 
 const KIT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TEMPLATE = join(KIT, 'template');
@@ -13,8 +15,11 @@ const MANIFEST = '.velspek.json';
 const TOOLS = ['claude', 'codex'];
 const SETTINGS = '.claude/settings.json';
 // Sections 0–8 of AGENTS.md live between the two markers; everything outside them belongs to the project.
-const BLOCK = /<!-- velspek:start[^>]*-->[\s\S]*<!-- velspek:end -->/;
-const BLOCK_AND_GAP = new RegExp(`${BLOCK.source}\\n*`);
+const START = /<!-- velspek:start[^>]*-->/;
+const END = /<!-- velspek:end -->/;
+const BLOCK = new RegExp(`${START.source}[\\s\\S]*${END.source}`);
+const BLOCK_AND_GAP = new RegExp(`${BLOCK.source}(\\r?\\n)*`);
+const SECTION_9 = /^## 9\. Project-specific[ \t]*\r?$/gm;
 const CODEX_POLICY = 'policy:\n  allow_implicit_invocation: false\n';
 const USAGE = `velspek ${VERSION}: a spec-driven development kit for AI coding agents
 
@@ -26,11 +31,14 @@ Usage: npx velspek <command> [directory] [options]
 
   --dry-run            show what would change, write nothing
   --force              overwrite or remove kit files that were changed locally
-  --only <tool>        install the skills of one tool: claude or codex`;
+  --only <tool>        init, update: install the skills of one tool, claude or codex`;
 
-const sha = (text) => createHash('sha256').update(text).digest('hex');
+// A checkout may turn line endings into CRLF. Text is compared and hashed with LF, and written with the endings its file has.
+const lf = (text) => text.replace(/\r\n/g, '\n');
+const withEndingsOf = (file, text) => (file.includes('\r\n') ? text.replace(/\n/g, '\r\n') : text);
+const sha = (text) => createHash('sha256').update(lf(text)).digest('hex');
 const readText = (path) => (existsSync(path) ? readFileSync(path, 'utf8') : null);
-const template = (path) => readFileSync(join(TEMPLATE, path), 'utf8');
+const template = (path) => lf(readFileSync(join(TEMPLATE, path), 'utf8'));
 
 function walk(dir, prefix = '') {
   return readdirSync(join(dir, prefix), { withFileTypes: true }).flatMap((entry) => {
@@ -53,12 +61,42 @@ function payload(tools) {
   return files;
 }
 
+// The record of an earlier install, or null. It names the files a run may overwrite or remove, so one that is not what `install` writes stops the run.
 function readManifest(root) {
   const text = readText(join(root, MANIFEST));
-  return text === null ? null : JSON.parse(text);
+  if (text === null) return null;
+  const damaged = (what) => new Error(`${MANIFEST} is damaged (${what}): restore it from version control and run the command again`);
+  const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const isRules = (rules) => Array.isArray(rules) && rules.every((rule) => typeof rule === 'string');
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch {
+    throw damaged('not valid JSON');
+  }
+  if (!isObject(manifest) || !isObject(manifest.files) || !isObject(manifest.settings)) throw damaged('not the record of an install');
+  if (!Array.isArray(manifest.tools) || manifest.tools.some((tool) => !TOOLS.includes(tool))) throw damaged(`tools are not of ${TOOLS.join(', ')}`);
+  if (!isRules(manifest.settings.allow) || !isRules(manifest.settings.deny)) throw damaged('settings do not list the allow and deny rules');
+  for (const [path, installed] of Object.entries(manifest.files)) {
+    const inside = relative(root, resolve(root, path));
+    if (inside === '' || isAbsolute(inside) || inside.split(sep)[0] === '..') throw damaged(`'${path}' is not a file of this project`);
+    if (typeof installed !== 'string') throw damaged(`'${path}' has no checksum`);
+  }
+  return manifest;
 }
 
-// Collects the changes of a run and the lines of its report; nothing is written before `apply`.
+// A write needs every folder on the way to its file to be a folder, or absent.
+function assertFolders(root, path) {
+  const parts = path.split('/');
+  for (let depth = 1; depth < parts.length; depth += 1) {
+    const folder = parts.slice(0, depth).join('/');
+    const stat = statSync(join(root, folder), { throwIfNoEntry: false });
+    if (stat && !stat.isDirectory()) throw new Error(`${folder} is a file, and the kit needs a folder there for ${path}: move it away and run the command again`);
+  }
+}
+
+// Collects the changes of a run and the lines of its report; nothing is written before `apply`, which first checks that every write can land.
+// A run that fails while writing is completed by running the command again: each file is compared with the kit anew.
 function output(root, dryRun) {
   const actions = [];
   return {
@@ -75,6 +113,7 @@ function output(root, dryRun) {
       this.note('removed', path);
     },
     apply() {
+      for (const { path, text } of actions) if (text !== null) assertFolders(root, path);
       if (dryRun) return;
       for (const { path, text } of actions) {
         const file = join(root, path);
@@ -90,24 +129,42 @@ function output(root, dryRun) {
   };
 }
 
+// The kit's block in the text of an AGENTS.md, or null. Markers other than one start above one end stop the run: replacing between them would take the project's own text along.
+function findBlock(agents) {
+  const [starts, ends] = [START, END].map((marker) => agents.split(marker).length - 1);
+  if (!starts && !ends) return null;
+  const block = BLOCK.exec(agents);
+  if (starts !== 1 || ends !== 1 || !block) throw new Error(`AGENTS.md has damaged velspek markers (${starts} start, ${ends} end): restore the one '<!-- velspek:start … -->' above and the one '<!-- velspek:end -->' below the kit's rules and run the command again`);
+  return block[0];
+}
+
 function syncAgents(root, out) {
   const kit = template('AGENTS.md');
-  const block = BLOCK.exec(kit)[0];
+  const block = findBlock(kit);
   const current = readText(join(root, 'AGENTS.md'));
   if (current === null) return out.write('AGENTS.md', kit, 'added');
-  if (BLOCK.test(current)) {
-    if (BLOCK.exec(current)[0] !== block) out.write('AGENTS.md', current.replace(BLOCK, () => block), 'updated');
+  const installed = findBlock(current);
+  if (installed !== null) {
+    if (lf(installed) !== block) out.write('AGENTS.md', current.replace(BLOCK, () => withEndingsOf(current, block)), 'updated');
     return;
   }
-  out.write('AGENTS.md', `${current.trimEnd()}\n\n${kit.slice(kit.indexOf(block))}`, 'updated');
+  // After an uninstall the section 9 the project filled is still there, and the block goes back above it.
+  const sections = current.match(SECTION_9)?.length ?? 0;
+  if (sections > 1) throw new Error("AGENTS.md has two sections '## 9. Project-specific' and no velspek block: keep one and run the command again");
+  if (sections === 1) {
+    out.write('AGENTS.md', current.replace(SECTION_9, (heading) => `${withEndingsOf(current, `${block}\n\n`)}${heading}`), 'updated');
+    out.note('note', 'AGENTS.md had no velspek block: the block was put before the section 9 it has');
+    return;
+  }
+  out.write('AGENTS.md', `${current.trimEnd()}${withEndingsOf(current, `\n\n${kit.slice(kit.indexOf(block))}`)}`, 'updated');
   out.note('note', 'AGENTS.md had no velspek block: the block and section 9 were appended to it');
 }
 
 // Adds the kit's permission rules to the settings and returns the ones it added, so that only those are removed later.
-// With `wanted` false it removes the rules added earlier.
+// With `wanted` false it removes the rules added earlier, and leaves alone a file it added nothing to.
 function syncSettings(root, out, added = { allow: [], deny: [] }, wanted = true) {
   const text = readText(join(root, SETTINGS));
-  if (text === null && !wanted) return { allow: [], deny: [] };
+  if (!wanted && (text === null || added.allow.length + added.deny.length === 0)) return { allow: [], deny: [] };
   const kit = wanted ? JSON.parse(template('claude/settings.json')).permissions : { allow: [], deny: [] };
   let settings;
   try {
@@ -140,13 +197,14 @@ function syncSettings(root, out, added = { allow: [], deny: [] }, wanted = true)
   return mine;
 }
 
+// The missing lines go above the project's own: the last matching line of a .gitignore decides, so the project's rules and exceptions keep their effect.
 function syncGitignore(root, out) {
   const wanted = template('gitignore').split('\n').filter(Boolean);
   const current = readText(join(root, '.gitignore'));
   if (current === null) return out.write('.gitignore', `${wanted.join('\n')}\n`, 'added');
   const present = new Set(current.split('\n').map((line) => line.trim()));
   const missing = wanted.filter((line) => !present.has(line));
-  if (missing.length) out.write('.gitignore', `${current.trimEnd()}\n${missing.join('\n')}\n`, 'updated');
+  if (missing.length) out.write('.gitignore', `${withEndingsOf(current, `${missing.join('\n')}\n`)}${current}`, 'updated');
 }
 
 // `init` and `update`: writes the kit's files, keeps the ones changed locally, and records what it installed.
@@ -159,7 +217,7 @@ export function install(root, { dryRun = false, force = false, only } = {}) {
   for (const [path, text] of files) {
     const current = readText(join(root, path));
     const installed = old?.files[path];
-    if (current === text) {
+    if (current !== null && lf(current) === text) {
       manifest.files[path] = sha(text);
     } else if (current === null || force || sha(current) === installed) {
       out.write(path, text, current === null ? 'added' : 'updated');
@@ -179,7 +237,8 @@ export function install(root, { dryRun = false, force = false, only } = {}) {
   manifest.settings = syncSettings(root, out, old?.settings, tools.includes('claude'));
   syncGitignore(root, out);
   const next = `${JSON.stringify(manifest, null, 2)}\n`;
-  if (readText(join(root, MANIFEST)) !== next) out.write(MANIFEST, next, old ? 'updated' : 'added');
+  const recorded = readText(join(root, MANIFEST));
+  if (recorded === null || lf(recorded) !== next) out.write(MANIFEST, next, old ? 'updated' : 'added');
   out.apply();
   return out.report;
 }
@@ -196,9 +255,9 @@ export function uninstall(root, { dryRun = false, force = false } = {}) {
     else out.note('kept', `${path} (changed locally; --force removes it)`);
   }
   const agents = readText(join(root, 'AGENTS.md'));
-  if (agents !== null && BLOCK.test(agents)) {
+  if (agents !== null && findBlock(agents) !== null) {
     const rest = agents.replace(BLOCK_AND_GAP, '');
-    if (rest === template('AGENTS.md').replace(BLOCK_AND_GAP, '')) out.remove('AGENTS.md');
+    if (lf(rest) === template('AGENTS.md').replace(BLOCK_AND_GAP, '')) out.remove('AGENTS.md');
     else out.write('AGENTS.md', rest, 'updated');
   }
   syncSettings(root, out, old.settings, false);
@@ -224,14 +283,24 @@ function main(argv) {
   const root = resolve(directory);
   if (!['init', 'update', 'uninstall'].includes(command) || words.length > 2) throw new Error(`expected one command: init, update or uninstall\n\n${USAGE}`);
   if ('only' in options && !TOOLS.includes(options.only)) throw new Error('--only takes claude or codex');
+  if ('only' in options && command === 'uninstall') throw new Error('uninstall removes the whole kit and takes no --only; to drop one tool, run "npx velspek update --only <the tool to keep>"');
   if (!existsSync(root)) throw new Error(`no directory ${root}`);
   if (command === 'update' && !readManifest(root)) throw new Error(`no ${MANIFEST} in ${root}: run "npx velspek init" first`);
   const report = command === 'uninstall' ? uninstall(root, options) : install(root, options);
   for (const line of report) console.log(line);
   const done = { init: 'installed', update: 'updated', uninstall: 'removed' }[command];
   console.log(report.length ? `\nvelspek ${VERSION}: ${options.dryRun ? 'dry run, nothing written' : done}` : `velspek ${VERSION}: already up to date`);
-  if (command === 'init' && !options.dryRun && report.length) {
-    console.log('\nNext:\n  1. Fill section 9 of AGENTS.md: chat language, stack, commands, ticket key, branches.\n  2. For each protected branch other than main, mirror the deny rules in .claude/settings.json.\n  3. Open a new agent session and check that AGENTS.md is loaded (docs/specs/README.md, "Tooling").');
+  if (command !== 'init' || options.dryRun) return;
+  if (report.length) {
+    const steps = ['Fill section 9 of AGENTS.md: chat language, stack, commands, ticket key, branches.'];
+    if (readManifest(root).tools.includes('claude')) steps.push('For each protected branch other than main, mirror the deny rules in .claude/settings.json.');
+    steps.push('Open a new agent session and check that AGENTS.md is loaded (docs/specs/README.md, "Tooling").');
+    console.log(`\nNext:\n${steps.map((step, index) => `  ${index + 1}. ${step}`).join('\n')}`);
+  }
+  const problems = check(root);
+  if (problems.length) {
+    console.log(`\nThe check the skills run, node docs/specs/_tools/check.mjs, reports ${problems.length} problem(s) in this project:\n${problems.map((problem) => `  ${problem}`).join('\n')}`);
+    console.log('It reads the documents under docs/specs, docs/adr and docs/investigations as specs, ADRs and investigations (docs/specs/README.md, "Tooling"). Nothing was changed in them.');
   }
 }
 

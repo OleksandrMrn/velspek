@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -30,6 +30,15 @@ function inProject(body) {
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+// Every file under `root`, by its path with forward slashes.
+function walk(root, prefix = '') {
+  return readdirSync(join(root, prefix), { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? walk(root, `${prefix}${entry.name}/`) : [`${prefix}${entry.name}`]));
+}
+
+const snapshot = (root) => Object.fromEntries(walk(root).sort().map((path) => [path, readFileSync(join(root, path), 'utf8')]));
+const crlf = (text) => text.replace(/\r?\n/g, '\r\n');
+const run = (...args) => spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
 
 const reports = (report, fragment) => assert.ok(report.some((line) => line.includes(fragment)), `no line with '${fragment}' in ${JSON.stringify(report)}`);
 const count = (text, part) => text.split(part).length - 1;
@@ -159,12 +168,28 @@ test('--only codex installs no Claude files, and a later update keeps that choic
   });
 });
 
-test('.gitignore gets the missing lines only', () => {
+test('.gitignore gets the missing lines only, above the lines of the project', () => {
   inProject(({ root, read, write }) => {
     write('.gitignore', 'node_modules/\n.env\n');
     install(root);
-    assert.equal(read('.gitignore'), 'node_modules/\n.env\n.DS_Store\n.env.*\n!.env.example\n.claude/settings.local.json\nCLAUDE.local.md\n');
+    assert.equal(read('.gitignore'), '.DS_Store\n.env.*\n!.env.example\n.claude/settings.local.json\nCLAUDE.local.md\nnode_modules/\n.env\n');
+    assert.deepEqual(install(root), []);
   });
+});
+
+test('the ignore rules of the project keep the last word', () => {
+  for (const own of ['.env*\n!.env.sample\n!.env.example\n', '.env\n!.env.example\n']) {
+    inProject(({ root, read, write }) => {
+      execFileSync('git', ['init', '-q', root]);
+      write('.gitignore', own);
+      install(root);
+      const ignored = (path) => spawnSync('git', ['-C', root, 'check-ignore', '-q', path]).status === 0;
+      assert.ok(ignored('.env') && ignored('.env.local') && ignored('CLAUDE.local.md'), own);
+      assert.ok(!ignored('.env.example'), own);
+      assert.equal(ignored('.env.sample'), !own.includes('.env.sample'), own);
+      assert.ok(read('.gitignore').endsWith(own));
+    });
+  }
 });
 
 test('uninstall removes the kit and keeps what the project wrote', () => {
@@ -203,4 +228,178 @@ test('the command line installs, checks and reports errors', () => {
     assert.equal(spawnSync(process.execPath, [CLI, 'init', root, '--only', 'cursor'], { encoding: 'utf8' }).status, 1);
     assert.equal(spawnSync(process.execPath, [CLI, 'sync'], { encoding: 'utf8' }).status, 1);
   });
+});
+
+test('a checkout with CRLF line endings is the same kit', () => {
+  inProject(({ root, read, write }) => {
+    install(root);
+    write('AGENTS.md', edit(read('AGENTS.md'), ['<!-- velspek:start', 'Our own rule.\n\n<!-- velspek:start']));
+    for (const path of walk(root)) write(path, crlf(read(path)));
+    assert.deepEqual(check(root), []);
+    assert.deepEqual(install(root), []);
+    write('AGENTS.md', edit(read('AGENTS.md'), ["## 1. Core rule: ask, don't assume", '## 1. An older rule']));
+    write('.gitignore', edit(read('.gitignore'), ['.DS_Store\r\n', '']));
+    assert.deepEqual(install(root), ['updated  AGENTS.md', 'updated  .gitignore']);
+    assert.match(read('AGENTS.md'), /## 1\. Core rule: ask, don't assume\r\n/);
+    assert.ok(read('.gitignore').startsWith('.DS_Store\r\n.env\r\n'));
+    for (const path of ['AGENTS.md', '.gitignore']) assert.doesNotMatch(read(path), /[^\r]\n/, path);
+    write('docs/specs/README.md', `${read('docs/specs/README.md')}ours\r\n`);
+    const report = uninstall(root);
+    assert.deepEqual(report.filter((line) => line.startsWith('kept')), ['kept     docs/specs/README.md (changed locally; --force removes it)']);
+    assert.deepEqual(walk(root).sort(), ['.gitignore', 'AGENTS.md', 'docs/specs/README.md']);
+    assert.ok(read('AGENTS.md').startsWith('# AGENTS.md — Rules for AI agents\r\n\r\nOur own rule.\r\n\r\n## 9. Project-specific\r\n'));
+    assert.doesNotMatch(read('AGENTS.md'), /[^\r]\n/);
+  });
+});
+
+test('damaged markers in AGENTS.md stop the run before anything is written', () => {
+  const start = /<!-- velspek:start[^>]*-->/;
+  const damages = {
+    'no end': (agents) => agents.replace('<!-- velspek:end -->', ''),
+    'a second end': (agents) => `${agents}\nOur own rule.\n\n<!-- velspek:end -->\n`,
+    'a second start': (agents) => `${agents}\n${start.exec(agents)[0]}\n`,
+    'the end before the start': (agents) => agents.replace('<!-- velspek:end -->', '').replace(start, (marker) => `<!-- velspek:end -->\n\n${marker}`),
+  };
+  for (const [name, damage] of Object.entries(damages)) {
+    inProject(({ root, read, write }) => {
+      install(root);
+      write('AGENTS.md', damage(read('AGENTS.md')));
+      write('docs/specs/README.md', 'a change the run would report\n');
+      const before = snapshot(root);
+      assert.throws(() => install(root, { force: true }), /velspek markers/, name);
+      assert.throws(() => uninstall(root, { force: true }), /velspek markers/, name);
+      assert.deepEqual(snapshot(root), before, name);
+    });
+  }
+});
+
+test('a reinstall puts the block back before the section 9 the project filled', () => {
+  inProject(({ root, read, write }) => {
+    install(root);
+    write('AGENTS.md', edit(read('AGENTS.md'), ['- Stack and versions:', '- Stack and versions: Go 1.23']));
+    const filled = read('AGENTS.md');
+    uninstall(root);
+    reports(install(root), 'the block was put before the section 9');
+    assert.equal(read('AGENTS.md'), filled);
+    assert.deepEqual(install(root), []);
+  });
+  inProject(({ root, read, write }) => {
+    write('AGENTS.md', '# Ours\n\n## 9. Deployment\n\nBy hand.\n');
+    install(root);
+    assert.ok(read('AGENTS.md').startsWith('# Ours\n\n## 9. Deployment\n\nBy hand.\n\n<!-- velspek:start'));
+    assert.equal(count(read('AGENTS.md'), '## 9. Project-specific'), 1);
+  });
+  inProject(({ root, write }) => {
+    write('AGENTS.md', '# Ours\n\n## 9. Project-specific\n\n- a\n\n## 9. Project-specific\n\n- b\n');
+    assert.throws(() => install(root), /two sections '## 9\. Project-specific'/);
+    assert.deepEqual(readdirSync(root), ['AGENTS.md']);
+  });
+});
+
+test('a damaged manifest stops the run before anything is touched', () => {
+  const damages = {
+    'not JSON': () => '{',
+    'no files': (manifest) => JSON.stringify({ ...manifest, files: [] }),
+    'an unknown tool': (manifest) => JSON.stringify({ ...manifest, tools: ['cursor'] }),
+    'a checksum that is no text': (manifest) => JSON.stringify({ ...manifest, files: { 'docs/specs/README.md': 1 } }),
+    'rules that are no list': (manifest) => JSON.stringify({ ...manifest, settings: { allow: 'all', deny: [] } }),
+    'a path above the project': (manifest) => JSON.stringify({ ...manifest, files: { ...manifest.files, '../outside.txt': sha('mine\n') } }),
+    'a path through the project and out': (manifest) => JSON.stringify({ ...manifest, files: { 'docs/../../outside.txt': sha('mine\n') } }),
+  };
+  for (const [name, damage] of Object.entries(damages)) {
+    inProject(({ root: parent, read, write }) => {
+      const root = join(parent, 'project');
+      mkdirSync(root);
+      install(root);
+      write('outside.txt', 'mine\n');
+      write('project/.velspek.json', damage(JSON.parse(read('project/.velspek.json'))));
+      const before = snapshot(parent);
+      assert.throws(() => install(root, { force: true }), /\.velspek\.json/, name);
+      assert.throws(() => uninstall(root, { force: true }), /\.velspek\.json/, name);
+      const failed = run('uninstall', root, '--force');
+      assert.equal(failed.status, 1, name);
+      assert.match(failed.stderr, /^velspek: \.velspek\.json/, name);
+      assert.deepEqual(snapshot(parent), before, name);
+    });
+  }
+});
+
+test('a file where the kit needs a folder stops the run before anything is written', () => {
+  inProject(({ root, write }) => {
+    write('.agents', 'ours\n');
+    assert.throws(() => install(root, { dryRun: true }), /\.agents is a file/);
+    assert.throws(() => install(root), /\.agents is a file/);
+    assert.deepEqual(readdirSync(root), ['.agents']);
+  });
+});
+
+test('a run that failed halfway is completed by the next one', { skip: process.platform === 'win32' || process.getuid() === 0 }, () => {
+  inProject(({ root, read, write, has }) => {
+    mkdirSync(join(root, '.agents'));
+    chmodSync(join(root, '.agents'), 0o555);
+    assert.throws(() => install(root), /EACCES/);
+    assert.ok(has('docs/specs/README.md') && !has('.velspek.json'));
+    chmodSync(join(root, '.agents'), 0o755);
+    install(root);
+    assert.deepEqual(install(root), []);
+    assert.deepEqual(check(root), []);
+
+    const manifest = JSON.parse(read('.velspek.json'));
+    manifest.files['docs/specs/README.md'] = sha('as installed before\n');
+    manifest.files['docs/adr/_template.md'] = sha('as installed before\n');
+    write('docs/adr/_template.md', 'as installed before\n');
+    write('.velspek.json', JSON.stringify(manifest));
+    assert.deepEqual(install(root), ['updated  docs/adr/_template.md', 'updated  .velspek.json']);
+    assert.deepEqual(install(root), []);
+
+    rmSync(join(root, 'docs/specs'), { recursive: true });
+    rmSync(join(root, '.claude/skills'), { recursive: true });
+    uninstall(root);
+    assert.deepEqual(readdirSync(root), ['.gitignore']);
+  });
+});
+
+test('uninstall takes no --only, and dropping one tool is an update', () => {
+  inProject(({ root, read, write, has }) => {
+    install(root);
+    const settings = JSON.parse(read('.claude/settings.json'));
+    settings.permissions.allow.push('Bash(npm test)');
+    write('.claude/settings.json', JSON.stringify(settings));
+    const before = snapshot(root);
+    for (const tool of ['claude', 'codex']) {
+      const failed = run('uninstall', root, '--only', tool);
+      assert.equal(failed.status, 1);
+      assert.match(failed.stderr, /update --only/);
+    }
+    assert.deepEqual(snapshot(root), before);
+    install(root, { only: 'codex' });
+    assert.ok(!has('.claude/skills') && has('.agents/skills/spec/SKILL.md'));
+    assert.deepEqual(JSON.parse(read('.claude/settings.json')).permissions, { allow: ['Bash(npm test)'], deny: [] });
+    assert.deepEqual(JSON.parse(read('.velspek.json')).settings, { allow: [], deny: [] });
+  });
+});
+
+test('--only codex leaves the Claude settings unread', () => {
+  inProject(({ root, read, write }) => {
+    write('.claude/settings.json', '{ // comment\n}');
+    const done = run('init', root, '--only', 'codex');
+    assert.equal(done.status, 0, done.stderr);
+    assert.doesNotMatch(done.stdout, /\.claude/);
+    assert.equal(read('.claude/settings.json'), '{ // comment\n}');
+  });
+  inProject(({ root }) => assert.match(run('init', root).stdout, /2\. For each protected branch other than main, mirror the deny rules in \.claude\/settings\.json/));
+});
+
+test('init names the documents of the project that the check does not accept', () => {
+  inProject(({ root, read, write }) => {
+    write('docs/adr/0001-record-architecture-decisions.md', '# 1. Record architecture decisions\n');
+    write('docs/specs/overview.md', '# Overview\n');
+    const done = run('init', root);
+    assert.equal(done.status, 0, done.stderr);
+    assert.match(done.stdout, /docs\/specs\/overview\.md: no front matter/);
+    assert.match(done.stdout, /docs\/adr\/0001-record-architecture-decisions\.md: no front matter/);
+    assert.equal(read('docs/specs/overview.md'), '# Overview\n');
+    assert.doesNotMatch(run('init', root, '--dry-run').stdout, /no front matter/);
+  });
+  inProject(({ root }) => assert.doesNotMatch(run('init', root).stdout, /problem/));
 });

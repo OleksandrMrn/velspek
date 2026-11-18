@@ -53,8 +53,8 @@ What `init` does with files you already have:
 |---|---|
 | `AGENTS.md` | Your text stays. The kit's rules are appended as one block between `<!-- velspek:start -->` and `<!-- velspek:end -->`, followed by section 9 for the project specifics. |
 | `.claude/settings.json` | The kit's allow and deny rules are added to yours; nothing is removed. |
-| `.gitignore` | Missing lines are appended. |
-| Specs, ADRs, investigations | Never touched. |
+| `.gitignore` | Missing lines are added above yours, so your own rules and exceptions keep the last word. |
+| Specs, ADRs, investigations | Never touched. `init` lists the ones the kit's check does not accept, such as ADRs in another format under `docs/adr/`. |
 
 Later:
 
@@ -68,11 +68,13 @@ npx velspek uninstall
 
 `update` replaces the block in `AGENTS.md` and the kit's own files; a file you changed locally is kept and reported. `uninstall` removes what was installed and leaves your documents, section 9 and `.gitignore`. Both read `.velspek.json`, the record of what was installed, so commit it.
 
+A run that cannot finish stops before it writes: a file where the kit needs a folder, a damaged `.velspek.json`, damaged markers in `AGENTS.md`. A run interrupted while writing is completed by running the same command again. A checkout that turns line endings into CRLF is not a local change.
+
 | Option | Effect |
 |---|---|
 | `--dry-run` | show what would change, write nothing |
 | `--force` | overwrite or remove kit files that were changed locally |
-| `--only claude` or `--only codex` | install the skills of one tool |
+| `--only claude` or `--only codex` | with `init` or `update`: install the skills of one tool; `update --only codex` drops the Claude Code set, and the other way round |
 
 ## What gets installed
 

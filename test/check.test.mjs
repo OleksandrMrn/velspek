@@ -77,6 +77,16 @@ test('front matter follows the template', () => {
   reports(problems({ [SPEC]: EXAMPLE.replace('---\n', '') }), 'no front matter');
 });
 
+test('CRLF line endings change nothing', () => {
+  const crlf = (text) => text.replace(/\n/g, '\r\n');
+  const folder = 'docs/investigations/shop';
+  assert.deepEqual(problems({ [SPEC]: crlf(EXAMPLE), [`${folder}/investigation.md`]: crlf(investigation(...READY)), [`${folder}/roadmap.md`]: '- S1. Check the payment API.\r\n' }), []);
+});
+
+test('a front matter key is given once', () => {
+  reports(spec(['approved_by:', 'status: draft\napproved_by:']), 'front matter key status is given twice');
+});
+
 test('a spec is named after its ticket, one per ticket', () => {
   reports(spec(['ticket: ABC-123', 'ticket: ABC-999']), "the file name must be 'ABC-999-<slug>.md'");
   reports(problems({ [SPEC]: EXAMPLE, 'docs/specs/ABC-123-again.md': EXAMPLE }), 'ticket ABC-123 has several specs');
@@ -93,6 +103,13 @@ test('tasks and sessions are numbered in order, every task in a session', () => 
   reports(spec(['### S2:', '### S3:']), 'the sessions must be S1, S2, … in order');
   reports(spec(['### S1:', '#### S1:']), 'T1 is in no session');
   reports(spec(['- [x] T3', '- T3'], ['- [x] T4', '- T4']), 'S2 has no task');
+});
+
+test('a checkbox under Tasks is a task', () => {
+  reports(spec(['- [x] T4', '- [ ] t4']), "'- [ ] t4 (R1, R5): events");
+  reports(spec(['- [x] T4', '- [X] T4']), "is not a task like '- [ ] T1 (R1): <task>'");
+  reports(spec(['- [x] T4', '- [x] Task 4']), 'is not a task like');
+  assert.deepEqual(spec(['- Check: the checks of R1', '  - [ ] a step of the person\n- Check: the checks of R1']), []);
 });
 
 test("a session has one 'Check' and one 'Checked', filled only when its tasks are ticked", () => {

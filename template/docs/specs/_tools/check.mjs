@@ -8,10 +8,13 @@ import { fileURLToPath } from 'node:url';
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
+// The text of a file with LF line endings, whatever a checkout made of them.
+const text = (path) => readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
+
 // Front matter is one unindented `key: value` per line, the value plain text up to an optional ` #` comment.
 function read(root, path, problems) {
   if (!existsSync(join(root, path))) return void problems.push(`${path}: missing`);
-  const lines = readFileSync(join(root, path), 'utf8').split('\n');
+  const lines = text(join(root, path)).split('\n');
   const end = lines.indexOf('---', 1);
   if (lines[0] !== '---' || end < 0) return void problems.push(`${path}: no front matter between two '---' lines`);
   const doc = { path, fields: {}, statuses: [], body: lines.slice(end + 1) };
@@ -23,6 +26,7 @@ function read(root, path, problems) {
     }
     const [value, comment = ''] = match[2].split(/ #(.*)/);
     if (/^(["']).*\1$/.test(value.trim())) problems.push(`${path}: the value of ${match[1]} is quoted; write it as plain text`);
+    if (Object.hasOwn(doc.fields, match[1])) problems.push(`${path}: front matter key ${match[1]} is given twice`);
     doc.fields[match[1]] = value.trim();
     if (match[1] === 'status') doc.statuses = comment.split('|').map((status) => status.trim());
   }
@@ -70,6 +74,8 @@ function checkSpec(doc, problems) {
       tasks.push(task);
       if (sessions.length) sessions.at(-1).tasks.push(task);
       else say(`T${task.number} is in no session`);
+    } else if (/^- \[.?\]/.test(line)) {
+      say(`'${line}' is not a task like '- [ ] T1 (R1): <task>'`);
     } else if (sessions.length && (match = /^- Check:(.*)$/.exec(line))) {
       sessions.at(-1).check.push(match[1].trim());
     } else if (sessions.length && (match = /^- Checked:(.*)$/.exec(line))) {
@@ -154,7 +160,7 @@ function checkInvestigations(root, problems) {
     if (section(doc, '## Coverage').some((line) => /^\|[^|]*\|\s*open\s*\|/.test(line))) say("the investigation is ready but 'Coverage' has an open area");
     if (!section(doc, '## Decisions').some((line) => /^- D\d+ \(\d{4}-\d{2}-\d{2}\)/.test(line))) say("the investigation is ready but 'Decisions' has no entry like '- D1 (<YYYY-MM-DD>). <question>'");
     const roadmap = join(root, dir, slug, 'roadmap.md');
-    if (!existsSync(roadmap) || !/^- S\d+\. [^<]/m.test(readFileSync(roadmap, 'utf8'))) say("the investigation is ready but roadmap.md has no step like '- S1. <step>'");
+    if (!existsSync(roadmap) || !/^- S\d+\. [^<]/m.test(text(roadmap))) say("the investigation is ready but roadmap.md has no step like '- S1. <step>'");
   }
 }
 
